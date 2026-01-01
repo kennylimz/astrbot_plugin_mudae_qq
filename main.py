@@ -427,13 +427,13 @@ class MyPlugin(Star):
             count = record_count
             await self.put_kv_data(key, (bucket, count + 1))
             if count >= limit:
-                # if count == limit:
-                #     chain = [
-                #         Comp.At(qq=user_id),
-                #         Comp.Plain("\u200b\n⚠本小时已达上限⚠")
-                #     ]
+                if count == limit:
+                    chain = [
+                        Comp.At(qq=user_id),
+                        Comp.Plain("\u200b\n⚠本小时已达上限⚠")
+                    ]
                     
-                #     yield event.chain_result(chain)
+                    yield event.chain_result(chain)
                 return
             count += 1
 

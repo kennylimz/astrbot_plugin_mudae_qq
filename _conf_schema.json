@@ -1,0 +1,30 @@
+{
+    "super_admins": {
+      "description": "超级管理员QQ号列表",
+      "type": "list",
+      "hint": "填写超级管理员QQ号列表",
+      "obvious_hint": true,
+      "default": []
+    },
+    "draw_hourly_limit": {
+      "description": "每小时抽卡次数",
+      "type": "int",
+      "hint": "每人每小时抽卡次数",
+      "obvious_hint": true,
+      "default": 5
+    },
+    "claim_cooldown": {
+      "description": "结婚冷却时间",
+      "type": "int",
+      "hint": "每次结婚后冷却时间",
+      "obvious_hint": true,
+      "default": 3600
+    },
+    "harem_max_size": {
+      "description": "后宫人数上限",
+      "type": "int",
+      "hint": "每个用户收集人数上限，到达后会无法收集更多角色",
+      "obvious_hint": true,
+      "default": 10
+    }
+}

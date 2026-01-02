@@ -600,7 +600,7 @@ class CCB_Plugin(Star):
         image_url = random.choice(images) if images else None
         gid = event.get_group_id() or "global"
         married_to = await self.get_kv_data(f"{gid}:{char.get('id')}:married_to", None)
-        chain = [Comp.Plain(f"ID: {char.get('id')}\n{name}\n{gender_mark}\nBangumi热度: {heat}")]
+        chain = [Comp.Plain(f"ID: {char.get('id')}\n{name}\n{gender_mark}\n热度: {heat}")]
         if image_url:
             chain.append(Comp.Image.fromURL(image_url))
         if married_to:
@@ -707,13 +707,13 @@ class CCB_Plugin(Star):
         menu_lines = [
             "用法：",
             f"系统设置 抽卡冷却 [0~600]",
-            f"抽卡冷却（秒） | 当前值: {config.get('draw_cooldown', 0)}",
+            f"———抽卡冷却（秒） | 当前值: {config.get('draw_cooldown', 0)}",
             "系统设置 抽卡次数 [1~10]",
-            f"每小时抽卡次数 | 当前值: {config.get('draw_hourly_limit', self.draw_hourly_limit_default)}",
+            f"———每小时抽卡次数 | 当前值: {config.get('draw_hourly_limit', self.draw_hourly_limit_default)}",
             "系统设置 后宫上限 [5~30]",
-            f"后宫人数上限 | 当前值: {config.get('harem_max_size', self.harem_max_size_default)}",
+            f"———后宫人数上限 | 当前值: {config.get('harem_max_size', self.harem_max_size_default)}",
             "系统设置 抽卡范围 [5000~20000]",
-            f"抽卡热度范围 | 当前值: {config.get('draw_scope', '无')}",
+            f"———抽卡热度范围 | 当前值: {config.get('draw_scope', '无')}",
         ]
         if feature is None:
             yield event.chain_result([Comp.Plain("\n".join(menu_lines))])

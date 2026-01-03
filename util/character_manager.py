@@ -40,10 +40,7 @@ class CharacterManager:
 
     def get_character_by_id(self, id):
         """O(1) lookup via cached id index; builds index on first use."""
-        try:
-            cid = int(id)
-        except Exception:
-            return None
+        cid = int(id)
         if self._id_index is None:
             self.load_characters()
         return self._id_index.get(cid)

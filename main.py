@@ -94,9 +94,9 @@ class CCB_Plugin(Star):
         '''用户回应抽卡结果和交换请求的处理器'''
         raw = getattr(event, "message_obj", None)
         raw_body = getattr(raw, "raw_message", None)
-        notice_type = raw_body.get("notice_type") if isinstance(raw_body, dict) else getattr(raw_body, "notice_type", None)
+        notice_type = getattr(raw_body, "notice_type", None)
         emoji_user = event.get_sender_id()
-        msg_id = raw_body.get("message_id") if isinstance(raw_body, dict) else getattr(raw_body, "message_id", None)
+        msg_id = getattr(raw_body, "message_id", None)
         now_ts = time.time()
         gid = event.get_group_id() or "global"
 

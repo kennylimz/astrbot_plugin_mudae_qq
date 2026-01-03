@@ -161,119 +161,122 @@ class CCB_Plugin(Star):
         '''抽卡！给结果贴表情来收集'''
         user_id = event.get_sender_id()
         gid = event.get_group_id() or "global"
-        key = f"{gid}:{user_id}:draw_status"
-        now_ts = time.time()
-        config = await self.get_group_cfg(gid)
-        limit = config.get("draw_hourly_limit", self.draw_hourly_limit_default)
-        now_tm = time.localtime(now_ts)
-        bucket = f"{now_tm.tm_year}-{now_tm.tm_yday}-{now_tm.tm_hour}"
-        record_bucket, record_count = await self.get_kv_data(key, (None, 0))
-        user_set = await self.get_user_list(gid)
-        cooldown = config.get("draw_cooldown", 0)
+        lock = self._get_group_lock(gid)
+        async with lock:
+            key = f"{gid}:{user_id}:draw_status"
+            now_ts = time.time()
+            config = await self.get_group_cfg(gid)
+            limit = config.get("draw_hourly_limit", self.draw_hourly_limit_default)
+            now_tm = time.localtime(now_ts)
+            bucket = f"{now_tm.tm_year}-{now_tm.tm_yday}-{now_tm.tm_hour}"
+            record_bucket, record_count = await self.get_kv_data(key, (None, 0))
+            user_set = await self.get_user_list(gid)
+            cooldown = config.get("draw_cooldown", 0)
 
-        cooldown = max(cooldown, int(len(user_set)/10))
-        if cooldown > 0:
-            last_draw_ts = await self.get_kv_data(f"{gid}:{user_id}:last_draw", 0)
-            if (now_ts - last_draw_ts) < cooldown:
-                # wait_sec = int(cooldown - (now_ts - last_draw_ts))
-                # yield event.chain_result([
-                #     Comp.At(qq=user_id),
-                #     Comp.Plain(f"抽卡冷却中，剩余{wait_sec}秒。")
-                # ])
+            cooldown = max(cooldown, int(len(user_set)/10))
+            if cooldown > 0:
+                last_draw_ts = await self.get_kv_data(f"{gid}:{user_id}:last_draw", 0)
+                if (now_ts - last_draw_ts) < cooldown:
+                    # wait_sec = int(cooldown - (now_ts - last_draw_ts))
+                    # yield event.chain_result([
+                    #     Comp.At(qq=user_id),
+                    #     Comp.Plain(f"抽卡冷却中，剩余{wait_sec}秒。")
+                    # ])
+                    return
+                await self.put_kv_data(f"{gid}:{user_id}:last_draw", now_ts)
+
+            if record_bucket != bucket:
+                count = 1
+                await self.put_kv_data(key, (bucket, count))
+            else:
+                count = record_count
+                await self.put_kv_data(key, (bucket, count + 1))
+                if count >= limit:
+                    if count == limit:
+                        chain = [
+                            Comp.At(qq=user_id),
+                            Comp.Plain("\u200b\n⚠本小时已达上限⚠")
+                        ]
+                        yield event.chain_result(chain)
+                    return
+                count += 1
+
+            remaining = limit - count
+            wish_list = await self.get_kv_data(f"{gid}:{user_id}:wish_list", [])
+            if random.random() < 0.001 and wish_list:
+                char_id = random.choice(wish_list)
+                character = self.char_manager.get_character_by_id(char_id)
+            else:
+                character = self.char_manager.get_random_character(limit=config.get('draw_scope', None))
+            if not character:
+                yield event.plain_result("卡池数据未加载")
                 return
-            await self.put_kv_data(f"{gid}:{user_id}:last_draw", now_ts)
+            name = character.get("name", "未知角色")
+            images = character.get("image") or []
+            image_url = random.choice(images) if images else None
+            char_id = character.get("id")
+            married_to = None
+            if char_id is not None:
+                claimed_by = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
+                if claimed_by:
+                    married_to = claimed_by
+            wished_by_key = f"{gid}:{char_id}:wished_by"
+            wished_by = await self.get_kv_data(wished_by_key, [])
+            
+            cq_message = []
+            if not married_to and wished_by:
+                for wisher in wished_by:
+                    cq_message.append({"type": "at", "data": {"qq": wisher}})
+                cq_message.append({"type": "text", "data": {"text": f"已许愿\n{name}"}})
+            else:
+                cq_message.append({"type": "text", "data": {"text": f"{name}"}})
+            if married_to:
+                cq_message.append({"type": "text", "data": {"text": "\u200b\n❤已与"}})
+                cq_message.append({"type": "at", "data": {"qq": married_to}})
+                cq_message.append({"type": "text", "data": {"text": "结婚，勿扰❤"}})
+            if image_url:
+                cq_message.append({"type": "image", "data": {"file": image_url}})
+            
+            if remaining == limit-1 and not married_to:
+                cq_message.append({"type": "text", "data": {"text": "💡回复任意表情和TA结婚"}})
+            if remaining <= 0:
+                cq_message.append({"type": "text", "data": {"text": "⚠本小时已达上限⚠"}})
 
-        if record_bucket != bucket:
-            count = 1
-            await self.put_kv_data(key, (bucket, count))
-        else:
-            count = record_count
-            await self.put_kv_data(key, (bucket, count + 1))
-            if count >= limit:
-                if count == limit:
-                    chain = [
-                        Comp.At(qq=user_id),
-                        Comp.Plain("\u200b\n⚠本小时已达上限⚠")
-                    ]
-                    yield event.chain_result(chain)
-                return
-            count += 1
-
-        remaining = limit - count
-        wish_list = await self.get_kv_data(f"{gid}:{user_id}:wish_list", [])
-        if random.random() < 0.001 and wish_list:
-            char_id = random.choice(wish_list)
-            character = self.char_manager.get_character_by_id(char_id)
-        else:
-            character = self.char_manager.get_random_character(limit=config.get('draw_scope', None))
-        if not character:
-            yield event.plain_result("卡池数据未加载")
-            return
-        name = character.get("name", "未知角色")
-        images = character.get("image") or []
-        image_url = random.choice(images) if images else None
-        char_id = character.get("id")
-        married_to = None
-        if char_id is not None:
-            claimed_by = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
-            if claimed_by:
-                married_to = claimed_by
-        wished_by_key = f"{gid}:{char_id}:wished_by"
-        wished_by = await self.get_kv_data(wished_by_key, [])
-        
-        cq_message = []
-        if not married_to and wished_by:
-            for wisher in wished_by:
-                cq_message.append({"type": "at", "data": {"qq": wisher}})
-            cq_message.append({"type": "text", "data": {"text": f"已许愿\n{name}"}})
-        else:
-            cq_message.append({"type": "text", "data": {"text": f"{name}"}})
-        if married_to:
-            cq_message.append({"type": "text", "data": {"text": "\u200b\n❤已与"}})
-            cq_message.append({"type": "at", "data": {"qq": married_to}})
-            cq_message.append({"type": "text", "data": {"text": "结婚，勿扰❤"}})
-        if image_url:
-            cq_message.append({"type": "image", "data": {"file": image_url}})
-        
-        if remaining == limit-1 and not married_to:
-            cq_message.append({"type": "text", "data": {"text": "💡回复任意表情和TA结婚"}})
-        if remaining <= 0:
-            cq_message.append({"type": "text", "data": {"text": "⚠本小时已达上限⚠"}})
-
-        try:
-            # 使用API获取消息ID
-            resp = await event.bot.api.call_action("send_group_msg", group_id=event.get_group_id(), message=cq_message)
-            msg_id = resp.get("message_id") if isinstance(resp, dict) else None
-            if msg_id is not None and not married_to:
-                # Maintain a small index; delete expired records
-                idx = await self.get_kv_data(f"{gid}:draw_msg_index", [])
-                cutoff = now_ts - DRAW_MSG_TTL
-                new_idx = []
-                if isinstance(idx, list):
-                    for item in idx:
-                        if not isinstance(item, dict):
-                            continue
-                        ts_old = item.get("ts", 0)
-                        mid_old = item.get("id")
-                        if ts_old and ts_old < cutoff and mid_old:
-                            await self.delete_kv_data(f"{gid}:draw_msg:{mid_old}")
-                            continue
-                        new_idx.append(item)
-                    idx = new_idx[-(DRAW_MSG_INDEX_MAX - 1) :] if len(new_idx) >= DRAW_MSG_INDEX_MAX else new_idx
-                else:
-                    idx = []
-                idx.append({"id": msg_id, "ts": now_ts})
-                await self.put_kv_data(f"{gid}:draw_msg_index", idx)
-                await self.put_kv_data(
-                    f"{gid}:draw_msg:{msg_id}",
-                    {
-                        "char_id": str(char_id),
-                        "ts": now_ts,
-                    },
-                )
-                await event.bot.api.call_action("set_msg_emoji_like", message_id=msg_id, emoji_id=66, set=True)
-        except Exception as e:
-            logger.error({"stage": "draw_send_error_bot", "error": repr(e)})
+            try:
+                # 使用NapCat的API获取消息ID
+                resp = await event.bot.api.call_action("send_group_msg", group_id=event.get_group_id(), message=cq_message)
+                msg_id = resp.get("message_id") if isinstance(resp, dict) else None
+                if msg_id is not None and not married_to:
+                    # Maintain a small index; delete expired records
+                    idx = await self.get_kv_data(f"{gid}:draw_msg_index", [])
+                    cutoff = now_ts - DRAW_MSG_TTL
+                    new_idx = []
+                    if isinstance(idx, list):
+                        for item in idx:
+                            if not isinstance(item, dict):
+                                continue
+                            ts_old = item.get("ts", 0)
+                            mid_old = item.get("id")
+                            if ts_old and ts_old < cutoff and mid_old:
+                                await self.delete_kv_data(f"{gid}:draw_msg:{mid_old}")
+                                continue
+                            new_idx.append(item)
+                        idx = new_idx[-(DRAW_MSG_INDEX_MAX - 1) :] if len(new_idx) >= DRAW_MSG_INDEX_MAX else new_idx
+                    else:
+                        idx = []
+                    idx.append({"id": msg_id, "ts": now_ts})
+                    await self.put_kv_data(f"{gid}:draw_msg_index", idx)
+                    await self.put_kv_data(
+                        f"{gid}:draw_msg:{msg_id}",
+                        {
+                            "char_id": str(char_id),
+                            "ts": now_ts,
+                        },
+                    )
+                    # 使用NapCat的API贴一个爱心表情
+                    await event.bot.api.call_action("set_msg_emoji_like", message_id=msg_id, emoji_id=66, set=True)
+            except Exception as e:
+                logger.error({"stage": "draw_send_error_bot", "error": repr(e)})
 
     async def handle_claim(self, event: AstrMessageEvent):
         '''结婚逻辑，给结果贴表情来收集。'''
@@ -383,31 +386,33 @@ class CCB_Plugin(Star):
             yield event.plain_result("用法：离婚 <角色ID>")
             return
         cid = int(str(cid).strip())
-        marry_list_key = f"{gid}:{user_id}:partners"
-        marry_list = await self.get_kv_data(marry_list_key, [])
-        cmd_msg_id = event.message_obj.message_id
-        if str(cid) not in marry_list:
+        lock = self._get_group_lock(gid)
+        async with lock:
+            marry_list_key = f"{gid}:{user_id}:partners"
+            marry_list = await self.get_kv_data(marry_list_key, [])
+            cmd_msg_id = event.message_obj.message_id
+            if str(cid) not in marry_list:
+                yield event.chain_result([
+                    Comp.Reply(id=cmd_msg_id),
+                    Comp.Plain(f"结了吗你就离？"),
+                ])
+                return
+
+            fav = await self.get_kv_data(f"{gid}:{user_id}:fav", None)
+            if fav and str(fav) == str(cid):
+                await self.delete_kv_data(f"{gid}:{user_id}:fav")
+            elif fav is not None and fav not in marry_list:
+                await self.delete_kv_data(f"{gid}:{user_id}:fav")
+
+            marry_list = [m for m in marry_list if m != str(cid)]
+            await self.put_kv_data(marry_list_key, marry_list)
+            await self.delete_kv_data(f"{gid}:{cid}:married_to")
+            cname = self.char_manager.get_character_by_id(cid).get("name") or ""
             yield event.chain_result([
                 Comp.Reply(id=cmd_msg_id),
-                Comp.Plain(f"结了吗你就离？"),
+                Comp.At(qq=event.get_sender_id()),
+                Comp.Plain(f"已与 {cname or cid} 离婚。"),
             ])
-            return
-
-        fav = await self.get_kv_data(f"{gid}:{user_id}:fav", None)
-        if fav and str(fav) == str(cid):
-            await self.delete_kv_data(f"{gid}:{user_id}:fav")
-        elif fav is not None and fav not in marry_list:
-            await self.delete_kv_data(f"{gid}:{user_id}:fav")
-
-        marry_list = [m for m in marry_list if m != str(cid)]
-        await self.put_kv_data(marry_list_key, marry_list)
-        await self.delete_kv_data(f"{gid}:{cid}:married_to")
-        cname = self.char_manager.get_character_by_id(cid).get("name") or ""
-        yield event.chain_result([
-            Comp.Reply(id=cmd_msg_id),
-            Comp.At(qq=event.get_sender_id()),
-            Comp.Plain(f"已与 {cname or cid} 离婚。"),
-        ])
 
     @filter.command("交换")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -952,3 +957,4 @@ class CCB_Plugin(Star):
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+

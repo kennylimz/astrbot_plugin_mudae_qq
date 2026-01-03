@@ -67,7 +67,6 @@ class CCB_Plugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_group_notice(self, event: AstrMessageEvent):
         '''用户回应抽卡结果和交换请求的处理器'''
-        event.should_call_llm(True)
         gid = event.get_group_id()
         if not gid:
             return  # commands are group-only
@@ -79,6 +78,7 @@ class CCB_Plugin(Star):
             user_set.add(uid)
             await self.put_user_list(gid, user_set)
 
+        # 检查是否为notice事件：event.message_obj.raw_message.post_type == "notice"
         raw = getattr(event, "message_obj", None)
         raw_body = getattr(raw, "raw_message", None)
         if isinstance(raw_body, dict):
@@ -86,6 +86,7 @@ class CCB_Plugin(Star):
         else:
             post_type = getattr(raw_body, "post_type", None)
 
+        # 检查是否为emoji事件：event.message_obj.raw_message.notice_type == "group_msg_emoji_like"
         if post_type == "notice":
             if isinstance(raw_body, dict):
                 notice_type = raw_body.get("notice_type")
@@ -159,8 +160,9 @@ class CCB_Plugin(Star):
         ]
         yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
         return
-
+    
     @filter.command("抽卡", alias={"ck"})
+    @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_draw(self, event: AstrMessageEvent):
         '''抽卡！给结果贴表情来收集'''
@@ -200,7 +202,6 @@ class CCB_Plugin(Star):
                         Comp.At(qq=user_id),
                         Comp.Plain("\u200b\n⚠本小时已达上限⚠")
                     ]
-                    
                     yield event.chain_result(chain)
                 return
             count += 1
@@ -597,7 +598,7 @@ class CCB_Plugin(Star):
     @filter.command("许愿")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_wish(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''许愿指定角色'''
+        '''许愿指定角色，稍稍增加概率'''
         gid = event.get_group_id() or "global"
         user_id = str(event.get_sender_id())
         config = await self.get_group_cfg(gid)
@@ -762,7 +763,7 @@ class CCB_Plugin(Star):
     @filter.command("强制离婚")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_force_divorce(self, event: AstrMessageEvent, cid: str | int | None = None):
-        '''强制移除指定角色的婚姻，可用于清除坏的数据（管理员专用）'''
+        '''强制移除指定角色的婚姻，用于清除坏的数据（管理员专用）'''
         group_role = await self.get_group_role(event)
         if group_role not in ['admin', 'owner'] and str(event.get_sender_id()) not in self.super_admins:
             yield event.plain_result("无权限执行此命令。")
@@ -774,7 +775,7 @@ class CCB_Plugin(Star):
         cid = int(str(cid).strip())
         await self.delete_kv_data(f"{gid}:{cid}:married_to")
 
-        # 遍历所有用户检查坏数据
+        # 遍历用户列表检查坏数据
         users = await self.get_kv_data(f"{gid}:user_list", [])
         for uid in users:
             partners_key = f"{gid}:{uid}:partners"

@@ -6,6 +6,7 @@ import astrbot.api.message_components as Comp
 import time
 from .util.character_manager import CharacterManager
 import random
+import asyncio
 
 DRAW_MSG_TTL = 45  # seconds to keep draw message records
 DRAW_MSG_INDEX_MAX = 300  # max tracked message ids to avoid unbounded growth
@@ -21,6 +22,7 @@ class CCB_Plugin(Star):
         self.harem_max_size_default = self.config.harem_max_size or 10
         self.group_cfgs = {}
         self.user_lists = {}
+        self.group_locks = {}
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -54,10 +56,18 @@ class CCB_Plugin(Star):
         resp = await event.bot.api.call_action("get_group_member_info", group_id=gid, user_id=uid)
         return resp.get("role", None)
 
+    def _get_group_lock(self, gid):
+        lock = self.group_locks.get(gid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.group_locks[gid] = lock
+        return lock
+
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def handle_group_notice(self, event: AstrMessageEvent):
         '''用户回应抽卡结果和交换请求的处理器'''
+        event.should_call_llm(True)
         gid = event.get_group_id()
         if not gid:
             return  # commands are group-only
@@ -82,9 +92,9 @@ class CCB_Plugin(Star):
             else:
                 notice_type = getattr(raw_body, "notice_type", None)
             if notice_type == "group_msg_emoji_like":
+                # stop further pipeline (including default LLM) for notice events
                 async for result in self.handle_emoji_like_notice(event):
                     yield result
-            return
 
     async def handle_emoji_like_notice(self, event: AstrMessageEvent):
         '''用户回应抽卡结果和交换请求的处理器'''
@@ -268,7 +278,6 @@ class CCB_Plugin(Star):
                     },
                 )
                 await event.bot.api.call_action("set_msg_emoji_like", message_id=msg_id, emoji_id=66, set=True)
-                return
         except Exception as e:
             logger.error({"stage": "draw_send_error_bot", "error": repr(e)})
 
@@ -281,62 +290,63 @@ class CCB_Plugin(Star):
         config = await self.get_group_cfg(gid)
         cooldown = config.get("claim_cooldown", self.claim_cooldown_default)
         now_ts = time.time()
-        
-
-        draw_msg = await self.get_kv_data(f"{gid}:draw_msg:{msg_id}", None)
-        await self.delete_kv_data(f"{gid}:draw_msg:{msg_id}")
-        if not draw_msg:
-            return
-        ts = draw_msg.get("ts", 0)
-        if ts and (now_ts - ts > DRAW_MSG_TTL):
-            return
-        char_id = draw_msg.get("char_id")
-        claimed_by = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
-        if claimed_by:
-            return
-        last_claim_ts = await self.get_kv_data(f"{gid}:{user_id}:last_claim", 0)
-        if (now_ts - last_claim_ts) < cooldown:
-            wait_sec = int(cooldown - (now_ts - last_claim_ts))
-            wait_min = max(1, (wait_sec + 59) // 60)
+        lock = self._get_group_lock(gid)
+        async with lock:
+            draw_msg = await self.get_kv_data(f"{gid}:draw_msg:{msg_id}", None)
+            await self.delete_kv_data(f"{gid}:draw_msg:{msg_id}")
+            if not draw_msg:
+                return
+            ts = draw_msg.get("ts", 0)
+            if ts and (now_ts - ts > DRAW_MSG_TTL):
+                return
+            char_id = draw_msg.get("char_id")
+            claimed_by = await self.get_kv_data(f"{gid}:{char_id}:married_to", None)
+            if claimed_by:
+                return
+            last_claim_ts = await self.get_kv_data(f"{gid}:{user_id}:last_claim", 0)
+            if (now_ts - last_claim_ts) < cooldown:
+                wait_sec = int(cooldown - (now_ts - last_claim_ts))
+                wait_min = max(1, (wait_sec + 59) // 60)
+                yield event.chain_result([
+                    Comp.At(qq=str(user_id)),
+                    Comp.Plain(f"结婚冷却中，剩余{wait_min}分钟。")
+                ])
+                await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
+                return
+            
+            char_id = draw_msg.get("char_id")
+            char = self.char_manager.get_character_by_id(char_id)
+            if not char:
+                return
+            
+            # Track per-user marriage list
+            marry_list_key = f"{gid}:{user_id}:partners"
+            marry_list = await self.get_kv_data(marry_list_key, [])
+            if len(marry_list) >= config.get("harem_max_size", self.harem_max_size_default):
+                yield event.chain_result([
+                    Comp.At(qq=user_id),
+                    Comp.Plain(f" 你的后宫已满{config.get('harem_max_size', self.harem_max_size_default)}，无法再结婚。")
+                ])
+                await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
+                return
+            if str(char_id) not in marry_list:
+                marry_list.append(str(char_id))
+            await self.put_kv_data(marry_list_key, marry_list)
+            await self.put_kv_data(f"{gid}:{char_id}:married_to", user_id)
+            await self.put_kv_data(f"{gid}:{user_id}:last_claim", now_ts)
+            gender = char.get("gender")
+            if gender == "女":
+                title = "老婆"
+            elif gender == "男":
+                title = "老公"
+            else:
+                title = ""
             yield event.chain_result([
-                Comp.At(qq=str(user_id)),
-                Comp.Plain(f"结婚冷却中，剩余{wait_min}分钟。")
-            ])
-            await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
-            return
-        
-        char_id = draw_msg.get("char_id")
-        char = self.char_manager.get_character_by_id(char_id)
-        if not char:
-            return
-
-        # Track per-user marriage list
-        marry_list_key = f"{gid}:{user_id}:partners"
-        marry_list = await self.get_kv_data(marry_list_key, [])
-        if len(marry_list) >= config.get("harem_max_size", self.harem_max_size_default):
-            yield event.chain_result([
+                Comp.Reply(id=msg_id),
+                Comp.Plain(f"🎉 {char.get('name')} 是 "),
                 Comp.At(qq=user_id),
-                Comp.Plain(f" 你的后宫已满{config.get('harem_max_size', self.harem_max_size_default)}，无法再结婚。")
+                Comp.Plain(f" 的{title}了！🎉")
             ])
-            return
-        if str(char_id) not in marry_list:
-            marry_list.append(str(char_id))
-        await self.put_kv_data(marry_list_key, marry_list)
-        await self.put_kv_data(f"{gid}:{char_id}:married_to", user_id)
-        await self.put_kv_data(f"{gid}:{user_id}:last_claim", now_ts)
-        gender = char.get("gender")
-        if gender == "女":
-            title = "老婆"
-        elif gender == "男":
-            title = "老公"
-        else:
-            title = ""
-        yield event.chain_result([
-            Comp.Reply(id=msg_id),
-            Comp.Plain(f"🎉 {char.get('name')} 是 "),
-            Comp.At(qq=user_id),
-            Comp.Plain(f" 的{title}了！🎉")
-        ])
 
     @filter.command("我的后宫")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -492,67 +502,69 @@ class CCB_Plugin(Star):
         from_cid = str(req.get("from_cid"))
         to_cid = str(req.get("to_cid"))
         user_set = await self.get_user_list(event.get_group_id())
+        lock = self._get_group_lock(gid)
 
-        if not (from_uid in user_set and to_uid in user_set):
-            return
+        async with lock:
+            if not (from_uid in user_set and to_uid in user_set):
+                return
 
-        from_claim_key = f"{gid}:{from_cid}:married_to"
-        to_claim_key = f"{gid}:{to_cid}:married_to"
-        from_marrried_to = await self.get_kv_data(from_claim_key, None)
-        to_marrried_to = await self.get_kv_data(to_claim_key, None)
+            from_claim_key = f"{gid}:{from_cid}:married_to"
+            to_claim_key = f"{gid}:{to_cid}:married_to"
+            from_marrried_to = await self.get_kv_data(from_claim_key, None)
+            to_marrried_to = await self.get_kv_data(to_claim_key, None)
 
-        # Validate ownership
-        if not (to_marrried_to and str(to_marrried_to) == to_uid):
-            yield event.plain_result("交换失败：对方已不再拥有该角色。")
-            return
-        if not (from_marrried_to and str(from_marrried_to) == from_uid):
-            yield event.plain_result("交换失败：你已不再拥有该角色。")
-            return
+            # Validate ownership
+            if not (to_marrried_to and str(to_marrried_to) == to_uid):
+                yield event.plain_result("交换失败：对方已不再拥有该角色。")
+                return
+            if not (from_marrried_to and str(from_marrried_to) == from_uid):
+                yield event.plain_result("交换失败：你已不再拥有该角色。")
+                return
 
-        from_fav = await self.get_kv_data(f"{gid}:{from_uid}:fav", None)
-        to_fav = await self.get_kv_data(f"{gid}:{to_uid}:fav", None)
-        if from_fav and str(from_fav) == from_cid:
-            await self.delete_kv_data(f"{gid}:{from_uid}:fav")
-        if to_fav and str(to_fav) == to_cid:
-            await self.delete_kv_data(f"{gid}:{to_uid}:fav")
+            from_fav = await self.get_kv_data(f"{gid}:{from_uid}:fav", None)
+            to_fav = await self.get_kv_data(f"{gid}:{to_uid}:fav", None)
+            if from_fav and str(from_fav) == from_cid:
+                await self.delete_kv_data(f"{gid}:{from_uid}:fav")
+            if to_fav and str(to_fav) == to_cid:
+                await self.delete_kv_data(f"{gid}:{to_uid}:fav")
 
-        from_list_key = f"{gid}:{from_uid}:partners"
-        to_list_key = f"{gid}:{to_uid}:partners"
-        from_list = await self.get_kv_data(from_list_key, [])
-        to_list = await self.get_kv_data(to_list_key, [])
+            from_list_key = f"{gid}:{from_uid}:partners"
+            to_list_key = f"{gid}:{to_uid}:partners"
+            from_list = await self.get_kv_data(from_list_key, [])
+            to_list = await self.get_kv_data(to_list_key, [])
 
-        if from_cid not in from_list or to_cid not in to_list:
-            logger.info({"stage": "exchange_fail_missing_role", "msg_id": msg_id})
-            yield event.plain_result("交换失败：有人没有对应角色。")
-            return
+            if from_cid not in from_list or to_cid not in to_list:
+                logger.info({"stage": "exchange_fail_missing_role", "msg_id": msg_id})
+                yield event.plain_result("交换失败：有人没有对应角色。")
+                return
 
-        from_list = [m for m in from_list if m != from_cid]
-        to_list = [m for m in to_list if m != to_cid]
-        from_list.append(to_cid)
-        to_list.append(from_cid)
-        await self.put_kv_data(from_list_key, from_list)
-        await self.put_kv_data(to_list_key, to_list)
+            from_list = [m for m in from_list if m != from_cid]
+            to_list = [m for m in to_list if m != to_cid]
+            from_list.append(to_cid)
+            to_list.append(from_cid)
+            await self.put_kv_data(from_list_key, from_list)
+            await self.put_kv_data(to_list_key, to_list)
 
-        await self.put_kv_data(to_claim_key, from_uid)
-        await self.put_kv_data(from_claim_key, to_uid)
-        logger.info({
-            "stage": "exchange_success",
-            "msg_id": msg_id,
-            "from_uid": from_uid,
-            "to_uid": to_uid,
-            "from_cid": from_cid,
-            "to_cid": to_cid,
-        })
+            await self.put_kv_data(to_claim_key, from_uid)
+            await self.put_kv_data(from_claim_key, to_uid)
+            logger.info({
+                "stage": "exchange_success",
+                "msg_id": msg_id,
+                "from_uid": from_uid,
+                "to_uid": to_uid,
+                "from_cid": from_cid,
+                "to_cid": to_cid,
+            })
 
-        from_cname = self.char_manager.get_character_by_id(from_cid).get("name") or str(from_cid)
-        to_cname = self.char_manager.get_character_by_id(to_cid).get("name") or str(to_cid)
-        yield event.chain_result([
-            Comp.Reply(id=str(msg_id)),
-            Comp.At(qq=from_uid),
-            Comp.Plain(" 与 "),
-            Comp.At(qq=to_uid),
-            Comp.Plain(f" 已完成交换：{from_cname} ↔ {to_cname}"),
-        ])
+            from_cname = self.char_manager.get_character_by_id(from_cid).get("name") or str(from_cid)
+            to_cname = self.char_manager.get_character_by_id(to_cid).get("name") or str(to_cid)
+            yield event.chain_result([
+                Comp.Reply(id=str(msg_id)),
+                Comp.At(qq=from_uid),
+                Comp.Plain(" 与 "),
+                Comp.At(qq=to_uid),
+                Comp.Plain(f" 已完成交换：{from_cname} ↔ {to_cname}"),
+            ])
 
     @filter.command("最爱")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -786,30 +798,31 @@ class CCB_Plugin(Star):
             yield event.plain_result("无权限执行此命令。")
             return
         gid = event.get_group_id() or "global"
-        if uid is None or not str(uid).strip().isdigit():
-            yield event.plain_result("用法：清理后宫 <QQ号>")
-            return
-        uid = str(uid).strip()
-        fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
-        marry_list = await self.get_kv_data(f"{gid}:{uid}:partners", [])
-        if not marry_list:
-            await self.delete_kv_data(f"{gid}:{uid}:fav")
-            await self.delete_kv_data(f"{gid}:{uid}:partners")
-            yield event.plain_result(f"{uid} 的后宫为空")
-            return
-        for cid in marry_list:
-            if str(cid) == str(fav):
-                continue
-            await self.delete_kv_data(f"{gid}:{cid}:married_to")
-        if fav is None:
-            await self.delete_kv_data(f"{gid}:{uid}:partners")
-        elif fav not in marry_list:
-            await self.delete_kv_data(f"{gid}:{uid}:fav")
-            await self.delete_kv_data(f"{gid}:{uid}:partners")
-        else:
-            await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
-            
-        yield event.plain_result(f"已清理 {uid} 的后宫")
+        lock = self._get_group_lock(gid)
+        async with lock:
+            if uid is None or not str(uid).strip().isdigit():
+                yield event.plain_result("用法：清理后宫 <QQ号>")
+                return
+            uid = str(uid).strip()
+            fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
+            marry_list = await self.get_kv_data(f"{gid}:{uid}:partners", [])
+            if not marry_list:
+                await self.delete_kv_data(f"{gid}:{uid}:fav")
+                await self.delete_kv_data(f"{gid}:{uid}:partners")
+                yield event.plain_result(f"{uid} 的后宫为空")
+                return
+            for cid in marry_list:
+                if str(cid) == str(fav):
+                    continue
+                await self.delete_kv_data(f"{gid}:{cid}:married_to")
+            if fav is None:
+                await self.delete_kv_data(f"{gid}:{uid}:partners")
+            elif fav not in marry_list:
+                await self.delete_kv_data(f"{gid}:{uid}:fav")
+                await self.delete_kv_data(f"{gid}:{uid}:partners")
+            else:
+                await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
+            yield event.plain_result(f"已清理 {uid} 的后宫")
 
     @filter.command("系统设置")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -920,26 +933,28 @@ class CCB_Plugin(Star):
             yield event.plain_result("确定要进行终极轮回吗？此操作将清除本群所有角色婚姻信息（除了最爱角色）。\n如果确定要执行，请使用“终极轮回 确认”")
             return
         gid = event.get_group_id() or "global"
-        users = await self.get_kv_data(f"{gid}:user_list", [])
-        for uid in users:
-            fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
-            marry_list = await self.get_kv_data(f"{gid}:{uid}:partners", [])
-            if not marry_list:
-                await self.delete_kv_data(f"{gid}:{uid}:fav")
-                await self.delete_kv_data(f"{gid}:{uid}:partners")
-                continue
-            for cid in marry_list:
-                if str(cid) == str(fav):
+        lock = self._get_group_lock(gid)
+        async with lock:
+            users = await self.get_kv_data(f"{gid}:user_list", [])
+            for uid in users:
+                fav = await self.get_kv_data(f"{gid}:{uid}:fav", None)
+                marry_list = await self.get_kv_data(f"{gid}:{uid}:partners", [])
+                if not marry_list:
+                    await self.delete_kv_data(f"{gid}:{uid}:fav")
+                    await self.delete_kv_data(f"{gid}:{uid}:partners")
                     continue
-                await self.delete_kv_data(f"{gid}:{cid}:married_to")
-            if fav is None:
-                await self.delete_kv_data(f"{gid}:{uid}:partners")
-            elif fav not in marry_list:
-                await self.delete_kv_data(f"{gid}:{uid}:fav")
-                await self.delete_kv_data(f"{gid}:{uid}:partners")
-            else:
-                await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
-        yield event.plain_result("已清除本群所有角色婚姻信息")
+                for cid in marry_list:
+                    if str(cid) == str(fav):
+                        continue
+                    await self.delete_kv_data(f"{gid}:{cid}:married_to")
+                if fav is None:
+                    await self.delete_kv_data(f"{gid}:{uid}:partners")
+                elif fav not in marry_list:
+                    await self.delete_kv_data(f"{gid}:{uid}:fav")
+                    await self.delete_kv_data(f"{gid}:{uid}:partners")
+                else:
+                    await self.put_kv_data(f"{gid}:{uid}:partners", [fav])
+            yield event.plain_result("已清除本群所有角色婚姻信息")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""

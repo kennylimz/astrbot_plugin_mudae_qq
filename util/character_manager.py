@@ -40,10 +40,13 @@ class CharacterManager:
 
     def get_character_by_id(self, id):
         """O(1) lookup via cached id index; builds index on first use."""
-        cid = int(id)
-        if self._id_index is None:
-            self.load_characters()
-        return self._id_index.get(cid)
+        try:
+            cid = int(id)
+            if self._id_index is None:
+                self.load_characters()
+            return self._id_index.get(cid)
+        except:
+            return None
 
     def search_characters_by_name(self, keyword: str) -> list[dict]:
         """Return characters whose name contains the keyword (case-insensitive)."""

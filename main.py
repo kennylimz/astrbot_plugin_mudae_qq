@@ -10,6 +10,8 @@ import aiohttp
 from .util.character_manager import CharacterManager
 import random
 import asyncio
+import datetime
+import re
 
 DRAW_MSG_TTL = 45  # seconds to keep draw message records
 DRAW_MSG_INDEX_MAX = 300  # max tracked message ids to avoid unbounded growth
@@ -90,11 +92,11 @@ class CCB_Plugin(Star):
 
         # 检查是否为notice事件：event.message_obj.raw_message.post_type == "notice"
         if (
-            event 
-            and getattr(event, "message_obj", None)
-            and getattr(event.message_obj, "raw_message", None)
-            and getattr(event.message_obj.raw_message, "post_type", None) == "notice"
-            and getattr(event.message_obj.raw_message, "notice_type", None) == "group_msg_emoji_like"
+                event
+                and getattr(event, "message_obj", None)
+                and getattr(event.message_obj, "raw_message", None)
+                and getattr(event.message_obj.raw_message, "post_type", None) == "notice"
+                and getattr(event.message_obj.raw_message, "notice_type", None) == "group_msg_emoji_like"
         ):
             # stop further pipeline (including default LLM) for notice events
             async for result in self.handle_emoji_like_notice(event):
@@ -107,7 +109,7 @@ class CCB_Plugin(Star):
         msg_id = event.message_obj.raw_message.message_id
         now_ts = time.time()
         gid = event.get_group_id() or "global"
-        
+
         draw_msg = await self.get_kv_data(f"{gid}:draw_msg:{msg_id}", None)
         if draw_msg:
             event.call_llm = True
@@ -158,6 +160,7 @@ class CCB_Plugin(Star):
             "================================",
             "管理员指令：",
             "系统设置 <功能> <参数>",
+            "系统设置 可抽卡时间范围 HH:mm-HH:mm",
             "清理后宫 <QQ号>",
             "强制离婚 <角色ID>",
             "================================",
@@ -167,7 +170,7 @@ class CCB_Plugin(Star):
         ]
         yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
         return
-    
+
     @filter.command("抽卡", alias={"ck"})
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -181,6 +184,27 @@ class CCB_Plugin(Star):
             key = f"{gid}:{user_id}:draw_status"
             now_ts = time.time()
             config = await self.get_group_cfg(gid)
+
+            time_range = config.get("draw_time_range")
+            if time_range:
+                tz = datetime.timezone(datetime.timedelta(hours=8))
+                now = datetime.datetime.now(tz)
+                current_minutes = now.hour * 60 + now.minute
+                start_time, end_time = time_range.split('-')
+                start_hour, start_min = map(int, start_time.split(':'))
+                end_hour, end_min = map(int, end_time.split(':'))
+                start_minutes = start_hour * 60 + start_min
+                end_minutes = end_hour * 60 + end_min
+
+                if start_minutes < end_minutes:
+                    if not (start_minutes <= current_minutes <= end_minutes):
+                        yield event.plain_result(f"现在还不能抽卡哦～，有效抽卡时间为{start_time} ～{end_time}")
+                        return
+                else:
+                    if not (current_minutes >= start_minutes or current_minutes <= end_minutes):
+                        yield event.plain_result(f"现在还不能抽卡哦～，有效抽卡时间为{start_time} ～{end_time}")
+                        return
+
             limit = config.get("draw_hourly_limit", self.draw_hourly_limit_default)
             now_tm = time.localtime(now_ts)
             bucket = f"{now_tm.tm_year}-{now_tm.tm_yday}-{now_tm.tm_hour}"
@@ -232,7 +256,7 @@ class CCB_Plugin(Star):
                     married_to = claimed_by
             wished_by_key = f"{gid}:{char_id}:wished_by"
             wished_by = await self.get_kv_data(wished_by_key, [])
-            
+
             cq_message = []
             ntr_chance = config.get("ntr_chance", 10)
             if married_to is not None and random.random() < ntr_chance*(1+len(wished_by)) / 100:
@@ -251,7 +275,7 @@ class CCB_Plugin(Star):
                 cq_message.append({"type": "text", "data": {"text": "结婚，勿扰❤"}})
             if image_url:
                 cq_message.append({"type": "image", "data": {"file": image_url}})
-            
+
             if remaining == limit-1 and not married_to:
                 cq_message.append({"type": "text", "data": {"text": "💡回复任意表情和TA结婚"}})
             if remaining <= 0:
@@ -340,7 +364,7 @@ class CCB_Plugin(Star):
                 ])
                 await self.put_kv_data(f"{gid}:draw_msg:{msg_id}", draw_msg)
                 return
-            
+
             # Claim path (NTR or normal): size check first
             marry_list_key = f"{gid}:{user_id}:partners"
             marry_list = await self.get_kv_data(marry_list_key, [])
@@ -1168,7 +1192,9 @@ class CCB_Plugin(Star):
             "系统设置 抽卡范围 [>5000]",
             f"———抽卡热度范围 | 当前值: {config.get('draw_scope', '无')}",
             "系统设置 牛头人 [0~100]",
-            f"———牛头人概率 | 当前值: {config.get('ntr_chance', 10)}"
+            f"———牛头人概率 | 当前值: {config.get('ntr_chance', 10)}",
+            "系统设置 可抽卡时间范围 HH:mm-HH:mm",
+            f"———可抽卡时间范围 | 当前值: {config.get('draw_time_range', '无限制')}"
         ]
         if feature is None:
             yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
@@ -1246,8 +1272,29 @@ class CCB_Plugin(Star):
             config["ntr_chance"] = value
             await self.put_group_cfg(event.get_group_id(), config)
             yield event.plain_result(f"现在抽到别人对象有{value}%概率可牛")
+        elif feature == "可抽卡时间范围":
+            if value is None:
+                yield event.plain_result("用法：可抽卡时间范围 HH:mm-HH:mm")
+                return
+            time_range_match = re.search(r'^(\d{2}:\d{2})-(\d{2}:\d{2})$', str(value).strip())
+            if not time_range_match:
+                yield event.plain_result("用法：可抽卡时间范围 HH:mm-HH:mm")
+                return
+            start_time = time_range_match.group(1)
+            end_time = time_range_match.group(2)
+            start_hour, start_min = map(int, start_time.split(':'))
+            end_hour, end_min = map(int, end_time.split(':'))
+            if start_hour < 0 or start_hour > 23 or start_min < 0 or start_min > 59:
+                yield event.plain_result("开始时间无效")
+                return
+            if end_hour < 0 or end_hour > 23 or end_min < 0 or end_min > 59:
+                yield event.plain_result("结束时间无效")
+                return
+            config["draw_time_range"] = f"{start_time}-{end_time}"
+            await self.put_group_cfg(event.get_group_id(), config)
+            yield event.plain_result(f"可抽卡时间范围已设置为 {start_time} ～ {end_time}")
         else:
-            yield event.chain_result([Comp.Plain("\n".join(menu_lines))]) 
+            yield event.chain_result([Comp.Plain("\n".join(menu_lines))])
 
     @filter.command("刷新")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)

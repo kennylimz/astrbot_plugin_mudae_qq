@@ -321,7 +321,7 @@ class CCB_Plugin(Star):
                         emoji_id = 66 # 爱心
                     await event.bot.api.call_action("set_msg_emoji_like", message_id=msg_id, emoji_id=emoji_id, set=True)
             except Exception as e:
-                logger.error({"stage": "draw_send_error_bot", "error": repr(e)})
+                logger.error({"stage": "draw_send_error_bot", "error": repr(e), "image_url":image_url})
 
     async def handle_claim(self, event: AstrMessageEvent, msg_id: str | int | None = None):
         '''结婚逻辑，给结果贴表情来收集。msg_id 可选，不传则从 event 取（表情触发时）；传则用做回复结婚时的抽卡消息 id。'''
